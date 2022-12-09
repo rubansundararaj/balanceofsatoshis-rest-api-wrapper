@@ -1,0 +1,2081 @@
+#!/usr/bin/env node
+const {lstat} = require('fs');
+const {mkdir} = require('fs');
+const {readdir} = require('fs');
+const {readFile} = require('fs');
+const {rmdir} = require('fs');
+const {spawn} = require('child_process');
+const {statSync} = require('fs');
+const {unlink} = require('fs');
+const {writeFile} = require('fs');
+
+const importLazy = require('import-lazy')(require);
+
+const accounting = importLazy('ln-accounting');
+const fetch = importLazy('@alexbosworth/node-fetch');
+const fiat = importLazy('@alexbosworth/fiat');
+const lnService = importLazy('ln-service');
+const lnSync = importLazy('ln-sync');
+const paidServices = importLazy('paid-services');
+const prog = require('@alexbosworth/caporal');
+
+const commandConstants = require('./commands/constants');
+
+const {accountingCategories} = commandConstants;
+const balances = importLazy('./balances');
+const chain = importLazy('./chain');
+const commands = importLazy('./commands');
+const display = importLazy('./display');
+const encryption = importLazy('./encryption');
+const lnd = importLazy('./lnd');
+const lnurl = importLazy('./lnurl');
+const {lnurlFunctions} = commandConstants;
+const network = importLazy('./network');
+const nodes = importLazy('./nodes');
+const offchain = importLazy('./offchain');
+const {peerSortOptions} = commandConstants;
+const peers = importLazy('./peers');
+const {priceProviders} = commandConstants;
+const {rateProviders} = commandConstants;
+const responses = importLazy('./responses');
+const routing = importLazy('./routing');
+const services = importLazy('./services');
+const {swapTypes} = commandConstants;
+const swaps = importLazy('./swaps');
+const telegram = importLazy('./telegram');
+const triggers = importLazy('./triggers');
+const wallets = importLazy('./wallets');
+const {version} = importLazy('./package');
+
+const {BOOL} = prog;
+const collect = arr => [].concat(...[arr]).filter(n => !!n);
+const {exit} = process;
+const flatten = arr => [].concat(...arr);
+const {FLOAT} = prog;
+const {floor} = Math;
+const hexMatch = /^[0-9a-f]+$/i;
+const {INT} = prog;
+const {keys} = Object;
+const lndForNode = (logger, node) => lnd.authenticatedLnd({logger, node});
+const months = [...Array(12).keys()].map(n => ++n);
+const {REPEATABLE} = prog;
+const {STRING} = prog;
+const yearMatch = /^\d{4}$/;
+prog
+  .version(version)
+
+  // Get accounting information
+  .command('accounting', 'Get an accounting rundown')
+  .argument('<category>', 'Report category', keys(accountingCategories))
+  .help(`Categories: ${keys(accountingCategories).join(', ')}`)
+  .help(`Rate providers: ${rateProviders.join(', ')}`)
+  .help('Privacy note: this requests tx related data from third parties')
+  .option('--csv', 'Output a CSV')
+  .option('--date <day>', 'Show only records for specific date')
+  .option('--disable-fiat', 'Avoid looking up fiat conversions for records')
+  .option('--month <month>', 'Show only records for specific month', months)
+  .option('--node <node_name>', 'Get details from named node')
+  .option('--rate-provider <rate_provider>', 'Rate provider', rateProviders)
+  .option('--year <year>', 'Show only records for specified year', yearMatch)
+  .action((args, options, logger) => {
+    const table = !!options.csv ? null : 'rows';
+
+    return new Promise(async (resolve, reject) => {
+      try {
+        return balances.getAccountingReport({
+          category: args.category,
+          date: options.date,
+          is_csv: !!options.csv,
+          is_fiat_disabled: options.disableFiat,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          month: options.month,
+          node: options.node,
+          rate_provider: options.rateProvider,
+          request: commands.simpleRequest,
+          year: options.year,
+        },
+        responses.returnObject({logger, reject, resolve, table}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Advertise to other nodes on the network
+  .command('advertise', 'Broadcast advertisement')
+  .help('use --filter conditions to limit broadcast scope: capacity > 1*m')
+  .help('--filter variables: CAPACITY/CHANNELS_COUNT/K/M')
+  .help('Default filter scope: channels_count > 9')
+  .help('To only advertise to direct peers use --max-hops 0')
+  .help('To avoid advertising to direct peers use --min-hops 1')
+  .option('--budget <budget>', 'Spending amount to allow for advertising', INT)
+  .option('--dryrun', 'Avoid actually sending advertisements')
+  .option('--filter <expression>', 'Require node match condition', REPEATABLE)
+  .option('--max-hops <max_hops>', 'Maximum number of relaying nodes', INT)
+  .option('--message <message>', 'Custom advertisement message')
+  .option('--min-hops <min_hops>', 'Minimum number of relaying nodes', INT)
+  .option('--node <node_name>', 'Advertise via saved node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return await services.advertise({
+          logger,
+          budget: options.budget || undefined,
+          filters: flatten([options.filter].filter(n => !!n)),
+          is_dry_run: !!options.dryrun,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          message: options.message,
+          max_hops: options.maxHops,
+          min_hops: options.minHops,
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Direct autopilot to mirror one or more nodes on the network
+  .command('autopilot', 'Enable autopilot')
+  .visible(false)
+  .argument('<status>', 'Status of autopilot', ['off', 'on'])
+  .help('Autopilot status is either on or off')
+  .help('Mirroring and urls require lnd --autopilot.heuristic=externalscore:1')
+  .option('--dryrun', 'Show scoring without changing autopilot settings')
+  .option('--mirror <pubkey>', 'Mirror channels of node', REPEATABLE)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Set autopilot on saved node')
+  .option('--url <url>', 'Follow nodes from a scoring URL', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return network.setAutopilot({
+          is_dry_run: !!options.dryrun,
+          is_enabled: args.status === 'on',
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          mirrors: flatten([options.mirror].filter(n => !!n)),
+          node: options.node,
+          request: commands.simpleRequest,
+          urls: flatten([options.url].filter(n => !!n)),
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get local balance information
+  .command('balance', 'Get total tokens')
+  .help('Sums balances on-chain, in channels, and pending, plus commit fees')
+  .option('--above <tokens>', 'Return tokens above watermark', INT)
+  .option('--below <tokens>', 'Return tokens below watermark', INT)
+  .option('--confirmed', 'Return confirmed funds only')
+  .option('--detailed', 'Return detailed balance information')
+  .option('--node <node_name>', 'Node to get balance for')
+  .option('--offchain', 'List only off-chain tokens')
+  .option('--onchain', 'List only on-chain tokens')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        // Exit early when detailed balance details are requested
+        if (!!options.detailed) {
+          return balances.getDetailedBalance({
+            lnd,
+            is_confirmed: options.confirmed,
+          },
+          responses.returnObject({logger, reject, resolve}));
+        }
+
+        return balances.getBalance({
+          lnd,
+          above: options.above,
+          below: options.below,
+          is_confirmed: !!options.confirmed,
+          is_offchain_only: !!options.offchain,
+          is_onchain_only: !!options.onchain,
+        },
+        responses.returnNumber({logger, reject, resolve, number: 'balance'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Broadcast a chain transaction
+  .command('broadcast', 'Submit a signed transaction to the mempool')
+  .argument('<tx>', 'Signed raw transaction')
+  .option('--description <description>', 'Describe the transaction being sent')
+  .option('--node <node_name>', 'Node to submit transaction on')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return lnSync.broadcastTransaction({
+          logger,
+          description: options.description,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          transaction: args.tx,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Call API directly
+  .command('call', 'Make a raw API call and to get a raw API response')
+  .help('If you do not specify a method it will list the supported methods')
+  .argument('[method]', 'Method to call')
+  .option('--node <node_name>', 'Saved node to use for call')
+  .option('--param <param>', 'query encoded name=value', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return commands.callRawApi({
+          logger,
+          ask: await commands.interrogate({}),
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          method: args.method,
+          params: flatten([options.param].filter(n => !!n)),
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get the number of days until the RPC cert expires
+  .command('cert-validity-days', 'Number of days until the cert is invalid')
+  .option('--below <number_of_days>', 'Return number of days below mark', INT)
+  .option('--node <node_name>', 'Node to check cert on')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      return lnd.getCertValidityDays({
+        logger,
+        below: options.below,
+        node: options.node,
+      },
+      responses.returnNumber({logger, reject, resolve, number: 'days'}));
+    });
+  })
+
+  // Deposit coins
+  .command('chain-deposit', 'Deposit coins in the on-chain wallet')
+  .help('--format address types supported: np2wpkh, p2tr, p2wpkh (default)')
+  .argument('[amount]', 'Amount to receive', INT)
+  .option('--format <format>', 'Address type', ['np2wpkh', 'p2tr', 'p2wpkh'])
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to deposit coins to')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.getDepositAddress({
+          format: options.format || undefined,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          tokens: args.amount,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get the current chain fee rates
+  .command('chainfees', 'Get the current chain fee estimates')
+  .help('Lookup chain fee estimates at various confirm targets')
+  .option('--blocks <depth>', 'Blocks confirm target depth to estimate to')
+  .option('--file <path>', 'Write the output to a JSON file at desired path')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to get chain fees view from')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.getChainFees({
+          blocks: options.blocks,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+        },
+        responses.returnObject({
+          logger,
+          reject,
+          resolve,
+          file: options.file,
+          write: writeFile,
+        }));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Change the capacity of an existing channel
+  .command('change-channel-capacity', 'Change the capacity of a channel')
+  .help('Remote node must be prepared to receive this type of request')
+  .help('The remote node should also run this same command after you propose')
+  .option('--node <node_name>', 'Use saved node details instead of local node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        const saved = await nodes.manageSavedNodes({
+          logger,
+          spawn,
+          ask: await commands.interrogate({}),
+          fs: {
+            writeFile,
+            getDirectoryFiles: readdir,
+            getFile: readFile,
+            getFileStatus: lstat,
+            makeDirectory: mkdir,
+            removeDirectory: rmdir,
+            removeFile: unlink,
+          },
+          is_including_lnd_api: true,
+          lock_credentials_to: [],
+          network: (await lnSync.getNetwork({lnd})).network,
+        });
+
+        return paidServices.changeChannelCapacity({
+          lnd,
+          logger,
+          ask: await commands.interrogate({}),
+          nodes: saved.nodes,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Show a chart of chain fees paid
+  .command('chart-chain-fees', 'Get a chart of chain fee expenses')
+  .help('Show chart of mining fee expenditure over time')
+  .help('Privacy note: this requests tx data from third parties')
+  .option('--days <days>', 'Chart over the past number of days', INT)
+  .option('--end <end_date>', 'End date for chart as YYYY-MM-DD', STRING)
+  .option('--no-color', 'Disable colors')
+  .option('--node <node_name>', 'Chain fees from saved node(s)', REPEATABLE)
+  .option('--start <start_date>', 'Start date for chart as YYYY-MM-DD', STRING)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return routing.getChainFeesChart({
+          days: options.days,
+          end_date: options.end,
+          is_monochrome: !!options.noColor,
+          lnds: (await lnd.getLnds({logger, nodes: options.node})).lnds,
+          request: commands.simpleRequest,
+          start_date: options.start,
+        },
+        responses.returnChart({logger, reject, resolve, data: 'data'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Show a chart of fees earned
+  .command('chart-fees-earned', 'Get a chart of earned routing fees')
+  .argument('[via]', 'Routing fees earned via a specified node or tag')
+  .help('Show the routing fees earned')
+  .option('--count', 'Show count of forwards instead of fees earned')
+  .option('--days <days>', 'Chart fees over the past number of days', INT)
+  .option('--end <end_date>', 'End date for chart as YYYY-MM-DD', STRING)
+  .option('--forwarded', 'Show amount forwarded instead of fees earned')
+  .option('--node <node_name>', 'Get saved node fees earned', REPEATABLE)
+  .option('--start <start_date>', 'Start date for chart as YYYY-MM-DD', STRING)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return routing.getFeesChart({
+          days: options.days,
+          end_date: options.end,
+          fs: {getFile: readFile},
+          is_count: options.count,
+          is_forwarded: options.forwarded,
+          lnds: (await lnd.getLnds({logger, nodes: options.node})).lnds,
+          start_date: options.start,
+          via: args.via || undefined,
+        },
+        responses.returnChart({logger, reject, resolve, data: 'data'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Show a chart of routing fees paid
+  .command('chart-fees-paid', 'Get a chart of paid routing fees')
+  .help('Show the routing fees paid to forwarding nodes')
+  .help('--rebalances can return results much more quickly')
+  .option('--days <days>', 'Chart fees over the past number of days', INT)
+  .option('--end <end_date>', 'End date for chart as YYYY-MM-DD', STRING)
+  .option('--in <key_or_alias>', 'Fees paid on routes in node with peer')
+  .option('--most-fees', 'View table of fees paid per node')
+  .option('--most-forwarded', 'View table of forwarded per node')
+  .option('--network', 'Show only non-peers in table view')
+  .option('--node <node_name>', 'Get fees chart for saved node(s)', REPEATABLE)
+  .option('--out <key_or_alias>', 'Fees paid on routes out node with peer')
+  .option('--peers', 'Show only peers in table view')
+  .option('--rebalances', 'Only consider fees paid in self-to-self transfers')
+  .option('--start <start_date>', 'Start date for chart as YYYY-MM-DD', STRING)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      const data = 'data';
+      const table = 'rows';
+
+      const asTable = responses.returnObject({logger, reject, resolve, table});
+      const chart = responses.returnChart({data, logger, reject, resolve});
+
+      try {
+        return routing.getFeesPaid({
+          days: options.days,
+          end_date: options.end,
+          fs: {getFile: readFile},
+          in: options.in,
+          is_most_fees_table: options.mostFees,
+          is_most_forwarded_table: options.mostForwarded,
+          is_network: options.network,
+          is_peer: options.peers,
+          is_rebalances_only: options.rebalances,
+          lnds: (await lnd.getLnds({logger, nodes: options.node})).lnds,
+          out: options.out,
+          start_date: options.start,
+        },
+        (options.mostFees || options.mostForwarded) ? asTable : chart);
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Chart earnings from payments received
+  .command('chart-payments-received', 'Get a chart of received payments')
+  .help('Show chart for settled invoices from external parties')
+  .option('--count', 'Show count of settled instead of amount received')
+  .option('--days <days>', 'Chart over the past number of days', INT)
+  .option('--end <end_date>', 'Final date for chart as YYYY-MM-DD', STRING)
+  .option('--for <query>', 'Only consider payments including a specific query')
+  .option('--node <node_name>', 'Get payments from saved node(s)', REPEATABLE)
+  .option('--start <start_date>', 'Start date for chart as YYYY-MM-DD', STRING)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return wallets.getReceivedChart({
+          days: options.days,
+          end_date: options.end,
+          is_count: options.count,
+          lnds: (await lnd.getLnds({logger, nodes: options.node})).lnds,
+          query: options.for,
+          start_date: options.start,
+        },
+        responses.returnChart({logger, reject, resolve, data: 'data'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Clean out failed payments
+  .command('clean-failed-payments', 'Clean out past failed payment data')
+  .help('Remove old failed payment data for probes and other failed payments')
+  .option('--dryrun', 'Avoid actually deleting the failed payment record')
+  .option('--node <node_name>', 'Clean failed payments on a saved node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return wallets.cleanFailedPayments({
+          logger,
+          is_dry_run: !!options.dryrun,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Determine the outcomes of channel closings
+  .command('closed', 'Get the status of a channel closings')
+  .help('Channel closes with chain-transaction derived resolution details')
+  .help('Privacy note: this requests tx data from third parties')
+  .option('--limit [limit]', 'Limit of closings to get', INT, 20)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Get channel closes from saved node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.getChannelCloses({
+          limit: options.limit,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          request: commands.simpleRequest,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Coordinate a new group channel
+  .command('create-channel-group', 'Coordinate balanced channels group')
+  .help('Other nodes can join the group using join-channel-group')
+  .help('When using --allow, all joining nodes must be identified')
+  .help('To specify order of group pairings, order using --allow ordering')
+  .option('--allow <public_key>', 'Only allow these nodes to join', REPEATABLE)
+  .option('--capacity <channel_capacity>', 'Channel capacity', INT, 5e6)
+  .option('--fee-rate <per_vbyte>', 'Chain fee rate for open', INT)
+  .option('--node <node_name>', 'Use saved node to create channels group')
+  .option('--size <count>', 'Number of group members', INT, 3)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        const defaultRate = await lnService.getChainFeeRate({lnd});
+
+        return await paidServices.createGroupChannel({
+          lnd,
+          logger,
+          capacity: options.capacity,
+          count: options.size,
+          members: flatten([options.allow].filter(n => !!n)),
+          rate: options.feeRate || floor(defaultRate.tokens_per_vbyte),
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Export LND credentials
+  .command('credentials', 'Export local credentials')
+  .help('Output encrypted remote access credentials. Use with "nodes --add"')
+  .option('--cleartext', 'Output remote access credentials without encryption')
+  .option('--days <days>', 'Expiration days for credentials', INT, 365)
+  .option('--method <method_name>', 'White-list specific method', REPEATABLE)
+  .option('--node <node_name>', 'Get credentials for a saved node')
+  .option('--nospend', 'Credentials do not include spending privileges')
+  .option('--readonly', 'Credentials only include read permissions')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      return lnd.getCredentials({
+        logger,
+        ask: await commands.interrogate({}),
+        expire_days: options.days,
+        is_cleartext: options.cleartext,
+        is_nospend: options.nospend,
+        is_readonly: options.readonly,
+        methods: flatten([options.method].filter(n => !!n)),
+        node: options.node,
+      },
+      responses.returnObject({logger, reject, resolve}));
+    });
+  })
+
+  // Decrypt a message
+  .command('decrypt', 'Decrypt data using the node key')
+  .visible(false)
+  .argument('<encrypted>', 'Encrypted message')
+  .help('Decrypt a message encrypted to the node key or to another node key')
+  .option('--node <node_name>', 'Node to decrypt with')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return encryption.decryptWithNode({
+          encrypted: args.encrypted,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Delete all payments
+  .command('delete-payments-history', 'Delete all records of past payments')
+  .visible(false)
+  .option('--node <node_name>', 'Node to delete all past payments on')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return lnService.deletePayments({
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Encrypt a message
+  .command('encrypt', 'Encrypt data using the node key')
+  .visible(false)
+  .help('Encrypt a message to the node key or to another node key')
+  .option('--node <node_name>', 'Node to encrypt with')
+  .option('--message <message>', 'Text message to encrypt')
+  .option('--to <to>', 'Encrypt message to another node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return encryption.encryptToNode({
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          message: options.message,
+          to: options.to,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Fan out utxos
+  .command('fanout', 'Fan out utxos')
+  .visible(false)
+  .argument('<size>', 'UTXO minimum size', INT)
+  .argument('<count>', 'Desired number of total utxos', INT)
+  .help('Make a bunch of utxos by making a tx with a bunch of outputs')
+  .option('--confirmed', 'Only consider confirmed existing utxos')
+  .option('--dryrun', 'Execute a fan-out dry run')
+  .option('--feerate <feerate>', 'Feerate in per vbyte rate', INT)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to do fan out for')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.splitUtxos({
+          count: args.count,
+          is_confirmed: !!options.confirmed,
+          is_dry_run: !!options.dryrun,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          size: args.size,
+          tokens_per_vbyte: options.feerate,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Show and set outbound fee rates
+  .command('fees', 'Show and adjust outbound fee rates')
+  .help('List out fee rates, fix problems with routing policies, set out fees')
+  .help('When setting fee, if channels pending, will wait for confirm to set')
+  .help('Set-fee-rate can use formulas: https://formulajs.info/functions/')
+  .help('Specify PERCENT(0.00) to set the fee as a fraction of routed amount')
+  .help('Specify BIPS() to set the fee as parts per thousand')
+  .help('You can use INBOUND and OUTBOUND in formulas for IF formulas')
+  .help('You can use INBOUND_FEE_RATE to mirror an inbound fee')
+  .help('You can use FEE_RATE_OF_<PUBKEY> to reference other node rates')
+  .option('--node <node_name>', 'Saved node (not peer to set fees on)')
+  .option('--set-cltv-delta <count>', 'Set the number of blocks for CLTV', INT)
+  .option('--set-fee-rate <rate>', 'Fee in parts per million or use a formula')
+  .option('--to <peer>', 'Peer key/alias/tag to set fees', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return routing.adjustFees({
+          logger,
+          cltv_delta: options.setCltvDelta,
+          fee_rate: options.setFeeRate,
+          fs: {getFile: readFile},
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          to: flatten([options.to].filter(n => !!n)),
+        },
+        responses.returnObject({logger, reject, resolve, table: 'rows'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Query the node to search for something
+  .command('find', 'Find a record')
+  .help('Look for something in the node db that matches a query')
+  .argument('<query>', 'Query for a record')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to find record on')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return lnd.findRecord({
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          query: args.query,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get forwards
+  .command('forwards', 'Show recent forwarding earnings')
+  .help('Peers where routing has taken place from inbound and outbound sides')
+  .help('Sorts: earned_in/earned_out/earned_total/inbound/liquidity/outbound')
+  .option('--complete', 'Show complete set of records in non table view')
+  .option('--days <days>', 'Number of past days to evaluate', INT)
+  .option('--in <from>', 'Forwards that originated from a specific peer')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to get forwards for')
+  .option('--out <to>', 'Forwards that sent out to a specified peer')
+  .option('--sort <type>', 'Sort forward-active peers by earnings/liquidity')
+  .option('--tag <tag_name>', 'Only show peers in a tag', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+        const table = !!options.complete ? undefined : 'rows';
+
+        return network.getForwards({
+          lnd,
+          days: options.days,
+          from: (await lnSync.findKey({lnd, query: options.in})).public_key,
+          fs: {getFile: readFile},
+          is_monochrome: !!options.noColor,
+          is_table: !options.complete,
+          sort: options.sort || undefined,
+          tags: collect(options.tag),
+          to: (await lnSync.findKey({lnd, query: options.out})).public_key,
+        },
+        responses.returnObject({logger, reject, resolve, table}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Fund and sign a chain transaction
+  .command('fund', 'Make a signed transaction spending on-chain funds')
+  .help('Use LND UTXOs to craft a signed raw transaction sending to addresses')
+  .help('Specify <address> <amount> <address> <amount> for addresses, amounts')
+  .help('Amounts support formulas, use MAX to reference selected UTXOs total')
+  .help('--utxo can be specified multiple times to spend multiple UTXOs')
+  .argument('<address_amount...>', 'Address and amount to send')
+  .option('--dryrun', 'Avoid locking up UTXOs')
+  .option('--fee-rate <fee>', 'Per vbyte fee rate for on-chain tx fee', INT)
+  .option('--node <node_name>', 'Node to spend coins')
+  .option('--select-utxos', 'Specify UTXOs to spend interactively from a list')
+  .option('--utxo <outpoint>', 'Spend a specific tx_id:vout', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.fundTransaction({
+          logger,
+          addresses: args.addressAmount.filter((n, i) => !(i % 2)),
+          amounts: args.addressAmount.filter((n, i) => i % 2),
+          ask: await commands.interrogate({}),
+          fee_tokens_per_vbyte: options.feeRate,
+          is_dry_run: !!options.dryrun,
+          is_selecting_utxos: options.selectUtxos,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          utxos: flatten([options.utxo].filter(n => !!n)),
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Gateway service
+  .command('gateway', 'Request gateway for https://ln-operator.github.io/')
+  .help('Start LND gateway server listening for Web UI access')
+  .help('Using the --remote option generates credentials for a remote gateway')
+  .option('--minutes <minutes>', 'Minutes credentials valid for', INT, 10)
+  .option('--node <node_name>', 'Node for gateway')
+  .option('--nospend', 'Credentials do not include spending privileges')
+  .option('--port <port>', 'Port for gateway', INT, 4805)
+  .option('--remote <url>', 'Output credentials for a remote gateway')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return lnd.gateway({
+          logger,
+          credentials: await lnd.lndCredentials({
+            is_nospend: options.nospend,
+            node: options.node,
+          }),
+          minutes: options.minutes,
+          is_nospend: options.nospend || undefined,
+          port: options.port,
+          remote: options.remote,
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Give a peer some tokens
+  .command('gift', 'Give a direct peer some free funds off-chain')
+  .visible(false)
+  .help('Send some funds to a connected peer')
+  .argument('<target>', 'Peer to give funds to')
+  .argument('<amount>', 'Tokens to give', INT)
+  .option('--node <node_name>', 'Source node to use to pay gift')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      const number = 'gave_tokens';
+
+      try {
+        return network.sendGift({
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          to: args.target,
+          tokens: args.amount,
+        },
+        responses.returnNumber({logger, number, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get the edges of a given node
+  .command('graph', 'List out the connections a node has with other nodes')
+  .argument('<alias_or_public_key>', 'Node in the graph to look up')
+  .help('--filter variables: AGE/CAPACITY/HOPS/IN_FEE_RATE/OUT_FEE_RATE')
+  .help('Example: --filter "age<7*144" for connections in the last week')
+  .option('--filter <formula>', 'Filter formula to apply', REPEATABLE)
+  .option('--node <node_name>', 'Node to use for lookup')
+  .option('--sort <sort_connections_by', 'Sort peers by field')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        return network.getGraphEntry({
+          lnd,
+          logger,
+          filters: flatten([options.filter].filter(n => !!n)),
+          fs: {getFile: readFile},
+          query: args.aliasOrPublicKey.trim(),
+          sort: options.sort,
+        },
+        responses.returnObject({logger, reject, resolve, table: 'rows'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Intercept inbound channel requests and set requirements for inbound opens
+  .command('inbound-channel-rules', 'Enforce rules for inbound channels')
+  .help('Rules should be written evaluating to TRUE to accept a channel')
+  .help('Example rule: --rule "CAPACITY > 100000"')
+  .help('Avoid requiring Blockchain confirmations using --trust-funding-from')
+  .help('For formulas: CAPACITIES are the sizes of the peer public channels')
+  .help('For formulas: CAPACITY is the size of the requested channel open')
+  .help('For formulas: CHANNEL_AGES are the block ages of public channels')
+  .help('For formulas: FEE_RATES are the outbound fee rates for the peer')
+  .help('For formulas: LOCAL_BALANCE is the gifted amount from the peer')
+  .help('For formulas: M is 1,000,000 - use like CAPACITY > 10*M')
+  .help('For formulas: PUBLIC_KEY is the public key of the requesting peer')
+  .help('For formulas: PRIVATE is when request is for private channel')
+  .help('For formulas: Use IF(X, Y, Z) to make branching condition rules')
+  .help('Try formulas on the sandbox: https://formulajs.info/functions/')
+  .option('--coop-close-address', 'Request using a cooperative close address')
+  .option('--node <node_name>', 'Saved node to reject inbound channels on')
+  .option('--reason <message>', 'Message to return when rejecting a request')
+  .option('--rule <formula>', 'Freeform rule for inbound channel', REPEATABLE)
+  .option('--trust-funding-from <key>', 'Trust channel funds from', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return await peers.interceptInboundChannels({
+          logger,
+          address: options.coopCloseAddress || undefined,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          reason: options.reason,
+          rules: flatten([options.rule].filter(n => !!n)),
+          trust: collect(options.trustFundingFrom),
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Intercept forwarding requests, enforce requirements on acceptance
+  .command('limit-forwarding', 'Enforce rules for routing payments')
+  .help('Setting --only-allow will disable all forwards except only allowed')
+  .help('--only-allow option can be repeated for multiple forwards')
+  .option('--node <node_name>', 'Saved node to enforce rules on')
+  .option('--disable-forwards', 'Disable all forwards')
+  .option('--max-hours-since-last-block <h>', 'Require fresh blocks', INT, 5)
+  .option('--max-new-pending-per-hour <h>', 'Limit held HTLCs', INT)
+  .option('--min-channel-confirmations <confs>', 'Minimum channel confs', INT)
+  .option('--only-allow <pair>', 'only forward fromKey/toKey', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return await peers.limitForwarding({
+          logger,
+          is_disabling_all_forwards: options.disableForwards || undefined,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          max_hours_since_last_block: options.maxHoursSinceLastBlock,
+          max_new_pending_per_hour: options.maxNewPendingPerHour,
+          min_channel_confirmations: options.minChannelConfirmations,
+          only_allow: flatten([options.onlyAllow].filter(n => !!n)),
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get inbound liquidity information: available inbound off-chain tokens
+  .command('inbound-liquidity', 'Get inbound liquidity size')
+  .option('--above <tokens>', 'Return amount above watermark', INT)
+  .option('--below <tokens>', 'Return amount above watermark', INT)
+  .option('--max-fee-rate <fee_rate>', 'Maximum fee rate to consider', INT)
+  .option('--node <node_name>', 'Node to get inbound liquidity')
+  .option('--top', 'Top percentile inbound liquidity in an individual channel')
+  .option('--with <node_key_or_tag>', 'Liquidity with a specific node/tag')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return balances.getLiquidity({
+          above: options.above || undefined,
+          below: options.below || undefined,
+          fs: {getFile: readFile},
+          is_top: options.top || undefined,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          max_fee_rate: options.maxFeeRate || undefined,
+          request: commands.simpleRequest,
+          with: options.with,
+        },
+        responses.returnNumber({logger, reject, resolve, number: 'balance'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Increase inbound liquidity
+  .command('increase-inbound-liquidity', 'Increase node inbound liquidity')
+  .help('Spend down a channel to get inbound. Fee is an estimate, may be more')
+  .help('If you want to control chain fee increases, use show-raw-recoveries')
+  .help('Formulas supported for --amount like 5*m or 0.05*BTC for 5 million')
+  .option('--address <out_address>', 'Out chain address to send funds out to')
+  .option('--api-key <api_key>', 'Pre-paid API key to use')
+  .option('--amount <amount>', 'Amount to increase inbound', STRING, '500*k')
+  .option('--avoid <pubkey/chan/tag>', 'Avoid forwarding through', REPEATABLE)
+  .option('--confs <confs>', 'Confs to consider reorg safe', INT, 1)
+  .option('--dryrun', 'Only show cost estimate for increase')
+  .option('--fast', 'Request swap server avoid batching delay')
+  .option('--max-deposit <max_deposit>', 'Maximum deposit amount', INT, 5e4)
+  .option('--max-fee <max_fee>', 'Maximum estimated fee tokens', INT, 3e4)
+  .option('--max-hours <max_hours>', 'Maximum hours to wait', INT, 65)
+  .option('--max-paths <max_paths>', 'Maximum paths to attempt', INT, 1)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Increase inbound liquidity on saved node')
+  .option('--recovery <recovery>', 'Recover in-progress swap')
+  .option('--service-socket', 'Specify a custom swap service address')
+  .option('--spend-address', 'Send an exact amount to a specific address')
+  .option('--spend-amount', 'Exact amount to send to a specific address')
+  .option('--show-raw-recovery', 'Show raw recovery transactions')
+  .option('--with <peer>', 'Public key of peer to increase liquidity from')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return swaps.swapOut({
+          fetch,
+          logger,
+          api_key: options.apiKey || undefined,
+          avoid: flatten([options.avoid].filter(n => !!n)),
+          confs: options.confs,
+          fs: {getFile: readFile},
+          is_fast: options.fast || false,
+          is_raw_recovery_shown: options.showRawRecovery || undefined,
+          is_dry_run: options.dryrun || false,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          max_deposit: options.maxDeposit,
+          max_fee: options.maxFee,
+          max_paths: options.maxPaths || undefined,
+          max_wait_blocks: Math.ceil((options.maxHours) * 60 / 10),
+          node: options.node || undefined,
+          out_address: options.address || undefined,
+          peer: options.with || undefined,
+          recovery: options.recovery,
+          request: commands.fetchRequest({fetch}),
+          socket: options.serviceSocket || undefined,
+          spend_address: options.spendAddress || undefined,
+          spend_tokens: options.spendAmount || undefined,
+          timeout: 1000 * 60 * 60 * 10,
+          tokens: accounting.parseAmount({amount: options.amount}).tokens,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Increase outbound liquidity
+  .command('increase-outbound-liquidity', 'Move on-chain funds off-chain')
+  .help('Open a new channel to add more off-chain liquidity')
+  .option('--amount <amount>', 'Amount to assign to new channel capacity', INT)
+  .option('--dryrun', 'Avoid actually opening a channel')
+  .option('--fee-rate <fee_rate>', 'Use specific fee rate (per vbyte)', FLOAT)
+  .option('--node <node_name>', 'Increase outbound liquidity on saved node')
+  .option('--private', 'Mark new channel as private')
+  .option('--set-fee-rate <ppm>', 'Fee in parts per million or use a formula')
+  .option('--with <peer_public_key>', 'Select a specific peer to open with')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return network.openChannel({
+          logger,
+          chain_fee_rate: options.feeRate || undefined,
+          fs: {getFile: readFile},
+          is_dry_run: options.dryrun,
+          is_private: options.private,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          peer: options.with || undefined,
+          request: commands.simpleRequest,
+          set_fee_rate: options.setFeeRate || undefined,
+          tokens: options.amount,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Create an invoice
+  .command('invoice', 'Create an invoice and get a BOLT 11 payment request')
+  .help('Amount can take m/k variables: 5*m for 5 million, 250*k = 0.0025')
+  .help('Fiat conversion is supported in amount, N*USD or N*EUR')
+  .help(`Fiat rate providers: ${priceProviders.join(', ')}`)
+  .help('--virtual invoices cannot be used with payers who probe before pay')
+  .help('Only one --virtual invoice can be active at a time')
+  .argument('[amount]', 'Amount for invoice', STRING, '0')
+  .option('--for <description>', 'What is the invoice requesting payment for')
+  .option('--include-hints', 'Include the default set of hop hint channels')
+  .option('--node <node_name>', 'Use saved node to create invoice')
+  .option('--rate-provider <rate_provider>', 'Rate provider', priceProviders)
+  .option('--select-hints', 'Select hop hints to be added to the request')
+  .option('--virtual', 'Request payment over a virtual channel')
+  .option('--virtual-fee-rate <pm>', 'Fee rate to use on virtual channel', INT)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return await offchain.createInvoice({
+          logger,
+          amount: args.amount,
+          ask: await commands.interrogate({}),
+          description: options.for,
+          is_hinting: options.includeHints || undefined,
+          is_selecting_hops: options.selectHints || undefined,
+          is_virtual: options.virtual || undefined,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          rate_provider: options.rateProvider || undefined,
+          request: commands.simpleRequest,
+          virtual_fee_rate: options.virtualFeeRate,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Join a group channel open
+  .command('join-channel-group', 'Join a balanced channels group')
+  .help('Another node should have run create-channel-group to create group')
+  .argument('<code>', 'Invite code to join group', STRING)
+  .option('--max-fee-rate <per_vbyte>', 'Maximum fee/vbyte for open', INT)
+  .option('--node <node_name>', 'Use saved node to join group')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        const defaultRate = await lnService.getChainFeeRate({
+          confirmation_target: 2,
+          lnd,
+        });
+
+        return await paidServices.joinGroupChannel({
+          lnd,
+          logger,
+          code: args.code,
+          max_rate: options.maxFeeRate || defaultRate.tokens_per_vbyte,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get the price for liquidity
+  .command('liquidity-cost', 'Get the price of liquidity')
+  .visible(false)
+  .argument('<type>', 'Liquidity direction', swapTypes)
+  .argument('<amount>', 'Amount of liquidity to get quote for', INT)
+  .argument('<api-key>', 'Swap API key to use', hexMatch)
+  .option('--above <tokens>', 'Return amount above watermark', INT)
+  .option('--fast', 'Avoid any server batching wait time')
+  .option('--node <node_name>', 'Node to get liquidity cost')
+  .option('--service-socket', 'Specify a custom swap service address')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        const {metadata, service} = await swaps.getPaidService({
+          fetch,
+          lnd,
+          logger,
+          socket: options.serviceSocket,
+          token: args.apiKey,
+        });
+
+        return swaps.getSwapCost({
+          lnd,
+          logger,
+          metadata,
+          service,
+          above: options.above,
+          is_fast: options.fast || undefined,
+          tokens: args.amount,
+          type: args.type,
+        },
+        responses.returnNumber({logger, reject, resolve, number: 'cost'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Lnurl functions
+  .command('lnurl', 'Collection of lnurl features')
+  .argument('<function>', 'lnurl function', keys(lnurlFunctions))
+  .help(`Functions: ${keys(lnurlFunctions).join(', ')}`)
+  .help('lnurl auth will request authorization')
+  .help('lnurl channel will request an incoming payment channel')
+  .help('lnurl pay will request a payment request from a service')
+  .help('lnurl withdraw will create an invoice and send it to a service')
+  .option('--avoid <avoid>', 'Avoid forwarding via node/chan/tag', REPEATABLE)
+  .option('--max-fee <max_fee>', 'Maximum fee to pay', INT, 1337)
+  .option('--max-paths <max_paths>', 'Maximum paths to use', INT, 1)
+  .option('--node <node_name>', 'Node to run a lnurl function')
+  .option('--out <public_key>', 'Make first hop through peer', REPEATABLE)
+  .option('--url <url>', 'URL to pay', STRING)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return lnurl.manageLnurl({
+          logger,
+          ask: await commands.interrogate({}),
+          avoid: flatten([options.avoid].filter(n => !!n)),
+          function: args.function,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          lnurl: options.url,
+          max_fee: options.maxFee,
+          max_paths: options.maxPaths,
+          out: flatten([options.out].filter(n => !!n)),
+          request: commands.simpleRequest,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Saved nodes
+  .command('nodes', 'List and edit saved nodes')
+  .help('Locking and unlocking requires existing installation of GPG')
+  .argument('[node]', 'Specify a saved node')
+  .option('--add', 'Add a new node')
+  .option('--lock <id>', 'Encrypt node authentication to GPG key', REPEATABLE)
+  .option('--remove', 'Remove saved node')
+  .option('--unlock', 'Remove encryption from auth macaroon')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      return nodes.manageSavedNodes({
+        logger,
+        spawn,
+        ask: await commands.interrogate({}),
+        fs: {
+          writeFile,
+          getDirectoryFiles: readdir,
+          getFile: readFile,
+          getFileStatus: lstat,
+          makeDirectory: mkdir,
+          removeDirectory: rmdir,
+          removeFile: unlink,
+        },
+        is_registering: options.add || undefined,
+        is_removing: options.remove || undefined,
+        is_unlocking: options.unlock || undefined,
+        lock_credentials_to: flatten([options.lock].filter(n => !!n)),
+        node: args.node || undefined,
+      },
+      responses.returnObject({logger, reject, resolve}));
+    });
+  })
+
+  // Open channels
+  .command('open', 'Open channels, optionally using an external wallet')
+  .help('When creating channels from an external wallet do not self-broadcast')
+  .help('Skip external option by specifying --internal-fund-at-fee-rate')
+  .help('For trusted funding specify --type as private-trusted/public-trusted')
+  .help('Trusted channel funding is not supported in LND 0.15.0 and below')
+  .argument('<peer_public_keys...>', 'With nodes with public keys')
+  .option('--amount <channel_capacity>', 'Capacities to open', REPEATABLE)
+  .option('--avoid-broadcast', 'Avoid broadcasting channel open transaction')
+  .option('--coop-close-address <addr>', 'Coop-close address', REPEATABLE)
+  .option('--external-funding', 'Use external funds for the channel open')
+  .option('--give <give_amount>', 'Amount to gift to peer', REPEATABLE)
+  .option('--internal-fund-at-fee-rate <per_vbyte>', 'Use internal funds', INT)
+  .option('--node <node_name>', 'Saved node to open channels')
+  .option('--opening-node <node_name>', 'Open with saved node', REPEATABLE)
+  .option('--set-fee-rate <ppm>', 'Set forward fee rate to peer', REPEATABLE)
+  .option('--type <type>', 'Type of channel (private/public)', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return peers.openChannels({
+          logger,
+          ask: await commands.interrogate({}),
+          capacities: collect(options.amount),
+          cooperative_close_addresses: collect(options.coopCloseAddress),
+          fs: {getFile: readFile},
+          gives: collect(options.give),
+          internal_fund_fee_rate: options.internalFundAtFeeRate || undefined,
+          is_avoiding_broadcast: options.avoidBroadcast || undefined,
+          is_external: options.externalFunding,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          opening_nodes: collect(options.openingNode),
+          public_keys: args.peerPublicKeys,
+          request: commands.simpleRequest,
+          set_fee_rates: collect(options.setFeeRate),
+          types: collect(options.type),
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Open a balanced channel with a peer
+  .command('open-balanced-channel', 'Open channel with equal start balances')
+  .help('Remote node must be prepared to receive this type of channel')
+  .help('The remote node should also run this same command after you propose')
+  .help('Channel details are negotiated with keysend so that is also required')
+  .option('--coop-close-address <addr>', 'Close address (for proposing open)')
+  .option('--node <node_name>', 'Use saved node details instead of local node')
+  .option('--recover <addr>', 'Recover if funds sent to an address by mistake')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return services.openBalancedChannel({
+          logger,
+          address: options.coopCloseAddress || undefined,
+          after: new Date(Date.now() - (1000 * 60 * 60 * 6)).toISOString(),
+          ask: await commands.interrogate({}),
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          recover: options.recover,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Open a group channel with multiple peers
+  .command('open-group-channel', 'Open balanced channels with multiple peers')
+  .help('Remote nodes must be prepared to participate in this type of channel')
+  .help('The remote node should also run this same command to join the group')
+  .option('--node <node_name>', 'Use saved node details instead of local node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return paidServices.manageGroupJoin({
+          logger,
+          ask: await commands.interrogate({}),
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get outbound liquidity information: available outbound off-chain tokens
+  .command('outbound-liquidity', 'Get outbound liquidity size')
+  .option('--above <tokens>', 'Return amount above watermark', INT)
+  .option('--below <tokens>', 'Return amount above watermark', INT)
+  .option('--node <node_name>', 'Node to get outbound liquidity amount')
+  .option('--top', 'Top percentile inbound liquidity in an individual channel')
+  .option('--with <public_key_or_tag>', 'Liquidity with a specific node/tag')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return balances.getLiquidity({
+          above: options.above || undefined,
+          below: options.below || undefined,
+          fs: {getFile: readFile},
+          is_outbound: true,
+          is_top: options.top || undefined,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          with: options.with,
+        },
+        responses.returnNumber({logger, reject, resolve, number: 'balance'}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Pay a payment request, probing first
+  .command('pay', 'Pay a payment request, probing first')
+  .argument('<request>', 'Payment Request')
+  .option('--avoid <avoid>', 'Avoid forwarding via node/chan/tag', REPEATABLE)
+  .option('--in <public_key>', 'Route through specific peer of destination')
+  .option('--max-fee <max_fee>', 'Maximum fee to pay', INT, 1337)
+  .option('--max-paths <paths>', 'Maximum paths to use', INT, 1)
+  .option('--message <message>', 'Attach text message to payment')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to use to pay payment request')
+  .option('--out <public_key>', 'Make first hop through peer', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        const inThrough = await lnSync.findKey({lnd, query: options.in});
+
+        return network.pay({
+          lnd,
+          logger,
+          avoid: flatten([options.avoid].filter(n => !!n)),
+          fs: {getFile: readFile},
+          in_through: inThrough.public_key,
+          is_real_payment: true,
+          max_fee: options.maxFee,
+          max_paths: options.maxPaths,
+          message: options.message,
+          out: flatten([options.out].filter(n => !!n)),
+          request: args.request,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get a list of channel-connected peers
+  .command('peers', 'Get a list of channel-connected peers')
+  .help(`Sort options: ${peerSortOptions.join(', ')}`)
+  .help('Icons: 🤢 often d/c, 💸 active HTLC, 💀 d/c, 🌚 private')
+  .help('Icons: 🧊 delayed coop close, ⏳ pending channel, 🚫 in disabled')
+  .help('Icons: 🦐 limited max htlc')
+  .help('Filters can take formula expressions to limit results')
+  .help('Filter variable AGE: "age > 144 * 7" for peers older than a week')
+  .help('Filter variable BLOCKS_SINCE_LAST_CHANNEL: blocks since recent open')
+  .help('Filter variable CAPACITY: "capacity > 8*m"')
+  .help('Filter variable DISK_USAGE_MB: "disk_usage_mb > 9" for disk estimate')
+  .help('Filter variable INBOUND_LIQUIDITY: "inbound_liquidity > 1*m"')
+  .help('Filter variable OUTBOUND_LIQUIDITY: "outbound_liquidity > 1*m"')
+  .option('--active', 'Only active peer channels')
+  .option('--complete', 'Show complete set of records in non table view')
+  .option('--fee-days <past_days>', 'Include fees earned over n days', INT)
+  .option('--filter <formula>', 'Filter formula to apply', REPEATABLE)
+  .option('--idle-days <days>', 'No receives or routes for n days', INT)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to get peers for')
+  .option('--offline', 'Only offline peer channels')
+  .option('--omit <key>', 'Omit peer with public key', REPEATABLE)
+  .option('--private', 'Only private channels')
+  .option('--public', 'Only peers with public channels')
+  .option('--sort <by>', 'Sort results by peer attribute', peerSortOptions)
+  .option('--tag <tag_name>', 'Only show peers in a tag', REPEATABLE)
+  .action((args, options, logger) => {
+    const table = !!options.complete ? undefined : 'rows';
+
+    return new Promise(async (resolve, reject) => {
+      try {
+        return network.getPeers({
+          earnings_days: options.feeDays,
+          filters: flatten([options.filter].filter(n => !!n)),
+          fs: {getFile: readFile},
+          idle_days: options.idleDays || undefined,
+          is_active: !!options.active,
+          is_monochrome: !!options.noColor,
+          is_offline: !!options.offline,
+          is_private: !!options.private,
+          is_public: !!options.public,
+          is_table: !options.complete,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          omit: flatten([options.omit].filter(n => !!n)),
+          sort_by: options.sort,
+          tags: flatten([options.tag].filter(n => !!n)),
+        },
+        responses.returnObject({logger, reject, resolve, table}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get the current fiat exchange price
+  .command('price', 'Get the price')
+  .help('Price is denominated in cents or equivalent')
+  .help('Rate provider options: coinbase, coindesk, or coingecko')
+  .argument('[symbols...]', 'Desired fiat tickers')
+  .option('--file <path>', 'Write the output to a JSON file at desired path')
+  .option('--from <provider>', 'Rate provider', priceProviders, 'coindesk')
+  .option('--no-color', 'Mute all colors')
+  .action((args, options, logger) => {
+    return new Promise((resolve, reject) => {
+      return fiat.getPrices({
+        from: options.from,
+        request: commands.simpleRequest,
+        symbols: args.symbols.map(n => n.toUpperCase()),
+      },
+      responses.returnObject({
+        logger,
+        reject,
+        resolve,
+        file: options.file,
+        write: writeFile,
+      }));
+    });
+  })
+
+  // Determine if a payment request is sendable
+  .command('probe', 'Check if a payment request is sendable')
+  .help('Simulate paying a payment request without actually paying it')
+  .argument('<to>', 'Payment request or node public key')
+  .argument('[amount]', 'Amount to probe, default: request amount')
+  .option('--avoid <avoid>', 'Avoid forwarding via node/chan/tag', REPEATABLE)
+  .option('--find-max', 'Find the maximum routeable amount on success route')
+  .option('--in <public_key>', 'Route through specific peer of destination')
+  .option('--max-paths <max>', 'Maximum paths to use for find-max', INT, 1)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to use for payment request check')
+  .option('--out <public_key>', 'Make first hop through peer', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        const inThrough = await lnSync.findKey({lnd, query: options.in});
+
+        return network.probe({
+          lnd,
+          logger,
+          avoid: flatten([options.avoid].filter(n => !!n)),
+          destination: args.to.length === 66 ? args.to : undefined,
+          find_max: !!options.findMax ? 16777215 : undefined,
+          fs: {getFile: readFile},
+          in_through: inThrough.public_key,
+          max_paths: options.maxPaths,
+          out: flatten([options.out].filter(n => !!n)),
+          request: args.to.length !== 66 ? args.to : undefined,
+          tokens: args.amount || undefined,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Rebalance between peers
+  .command('rebalance', 'Rebalance funds between peers')
+  .help('Change the liquidity profile of two peers')
+  .help('Specifying target liquidity you can use CAPACITY/2, other formulas')
+  .help('You can specify tags for --avoid, --in, --out (see help tags)')
+  .help('--amount can take m/k variables: 5*m for 5 million, 250*k = 0.0025')
+  .help('--avoid can take a channel id or a public key to avoid')
+  .help('--avoid can take a public_key/public_key to avoid a directed pair')
+  .help('--avoid can take a FORMULA/public_key to avoid inbound peers')
+  .help('--avoid can take a public_key/FORMULA to avoid outbound peers')
+  .help('--avoid FORMULA variables: FEE_RATE, BASE_FEE, HEIGHT, AGE')
+  .help('--in decreases the inbound liquidity with a specific peer/tag')
+  .help('--in-filter/--out-filter vars: CAPACITY/HEIGHTS/INBOUND_LIQUIDITY')
+  .help('--in-filter/--out-filter vars: OUTBOUND_LIQUIDITY/PENDING_PAYMENTS')
+  .help('--in-filter/--out-filter vars: INBOUND_FEE_RATE')
+  .help('--out increases the inbound liquidity with a specific peer/tag')
+  .option('--amount <amount>', 'Maximum amount to rebalance')
+  .option('--avoid <pubkey_or_chanid>', 'Avoid forwarding through', REPEATABLE)
+  .option('--avoid-high-fee-routes', 'Avoid trying routes above max-fee-rate')
+  .option('--in <pubkey_or_alias>', 'Route in through a specific peer')
+  .option('--in-filter <in_filter>', 'Filter inbound tag nodes', REPEATABLE)
+  .option('--in-target-outbound <amt>', 'Balance up to outbound amount')
+  .option('--max-fee <max_fee>', 'Maximum fee to pay')
+  .option('--max-fee-rate <max_fee_rate>', 'Max fee rate to pay')
+  .option('--minutes <minutes>', 'Time-out route search after N minutes', INT)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Saved node to use for rebalance')
+  .option('--out <pubkey_or_alias>', 'Route out through a specific peer')
+  .option('--out-filter <out_filter>', 'Filter outbound tag nodes', REPEATABLE)
+  .option('--out-target-inbound <amount>', 'Balance up to inbound amount')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return swaps.manageRebalance({
+          logger,
+          avoid: flatten([options.avoid].filter(n => !!n)),
+          fs: {getFile: readFile},
+          in_filters: flatten([options.inFilter].filter(n => !!n)),
+          in_outbound: options.inTargetOutbound || undefined,
+          in_through: options.in || undefined,
+          is_strict_max_fee_rate: options.avoidHighFeeRoutes || undefined,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          max_fee: options.maxFee,
+          max_fee_rate: options.maxFeeRate,
+          max_rebalance: options.amount,
+          out_filters: flatten([options.outFilter].filter(n => !!n)),
+          out_inbound: options.outTargetInbound,
+          out_through: options.out || undefined,
+          timeout_minutes: options.minutes || undefined,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Attempt reconnecting to disconnected channel partners
+  .command('reconnect', 'Reconnect to disconnected channel partners')
+  .help('Inactive channels are also treated as disconnected channels')
+  .help('This reconnects to all peers. Do not use --node to specify a peer')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Saved node to attempt reconnects on')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return network.reconnect({
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Recover funds sent to p2pk using the node identity key
+  .command('recover-p2pk', 'Recover chain funds sent to the node identity key')
+  .help('Sweep funds sent to your node public key into your regular wallet')
+  .argument('<id>', 'Transaction id of funds sent to p2pk')
+  .argument('<vout>', 'Transaction output index of funds sent to p2pk', INT)
+  .option('--node <node_name>', 'Node to attempt p2pk recovery on')
+  .visible(false)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.recoverP2pk({
+          id: args.id,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          request: commands.simpleRequest,
+          vout: args.vout,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Remove a peer
+  .command('remove-peer', 'Close out with a channel-connected peer')
+  .help('--filter command uses same filters as peers command')
+  .help('--address can have multiple addresses specified')
+  .argument('[public_key]', 'Choose a specific peer to close with')
+  .option('--active', 'Make sure the peer is online')
+  .option('--address <address>', 'Address to close out funds to', REPEATABLE)
+  .option('--dryrun', 'Avoid actually closing channels with peer')
+  .option('--fee-rate <rate>', 'Fee rate per vbyte to close out with', FLOAT)
+  .option('--filter <formula>', 'Filter formula to apply', REPEATABLE)
+  .option('--force', 'Force close channels if they cannot be coop closed')
+  .option('--idle-days <days>', 'No receives or routes for n days', INT)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to remove peer on')
+  .option('--offline', 'Make sure the peer is offline')
+  .option('--omit <key>', 'Avoid closing peer with public key', REPEATABLE)
+  .option('--outpoint', 'Only remove specific channel with funding txid:vout')
+  .option('--private', 'Peer is privately connected')
+  .option('--public', 'Peer is publicly connected')
+  .option('--select-channels', 'Select channels to remove interactively')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        return network.removePeer({
+          lnd,
+          logger,
+          addresses: flatten([options.address].filter(n => !!n)),
+          ask: await commands.interrogate({}),
+          chain_fee_rate: options.feeRate || undefined,
+          filters: flatten([options.filter].filter(n => !!n)),
+          fs: {getFile: readFile},
+          idle_days: options.idleDays,
+          inbound_liquidity_below: options.inboundBelow,
+          is_active: !!options.active,
+          is_dry_run: !!options.dryrun,
+          is_forced: !!options.force,
+          is_offline: !!options.offline,
+          is_private: !!options.private,
+          is_public: !!options.public,
+          is_selecting_channels: options.selectChannels || undefined,
+          omit: flatten([options.omit].filter(n => !!n)),
+          outbound_liquidity_below: options.outboundBelow,
+          outpoints: flatten([options.outpoint].filter(n => !!n)),
+          public_key: args.publicKey,
+          request: commands.simpleRequest,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // See a general report about the node
+  .command('report', 'Report about the node')
+  .option('--node <node_name>', 'Node to get report for')
+  .option('--styled', 'Add unicode styling to report')
+  .action((args, options, logger) => {
+    return new Promise((resolve, reject) => {
+      return wallets.getReport({
+        fs: {getFile: readFile},
+        node: options.node,
+        request: commands.simpleRequest,
+        style: !!options.styled ? 'styled' : undefined,
+      },
+      responses.returnOutput({logger, reject, resolve}));
+    });
+  })
+
+  // Send funds to a destination
+  .command('send', 'Send funds to a node off-chain')
+  .help('Formulas supported in amount, and N*USD or N*EUR')
+  .help('Also supported in formulas: LIQUIDITY, INBOUND, OUTBOUND (with peer)')
+  .help('OUT_INBOUND, OUT_OUTBOUND (when specifying outbound peer)')
+  .argument('<to>', 'Send to public key, zero pay request, lnurl, ln.address')
+  .option('--amount <amount>', 'Amount to send to destination', STRING, '1')
+  .option('--avoid <avoid>', 'Avoid forwarding via node/chan/tag', REPEATABLE)
+  .option('--dryrun', 'Avoid actually sending funds')
+  .option('--in <pubkey_or_alias>', 'Route in through a specific node')
+  .option('--max-fee <fee>', 'Maximum fee tokens', INT, 1337)
+  .option('--max-fee-rate <max_fee_rate>', 'Max fee rate in PPM to pay', INT)
+  .option('--message <message>', 'Message to include with payment')
+  .option('--message-omit-from-key', 'Leave out the from key on messages')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <name>', 'Node to send funds from')
+  .option('--out <pubkey_or_alias>', 'Route out through a specific peer')
+  .option('--quiz <answer>', 'Quiz answers, first answer correct', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return network.pushPayment({
+          logger,
+          amount: options.amount,
+          avoid: flatten([options.avoid].filter(n => !!n)),
+          destination: args.to,
+          fs: {getFile: readFile},
+          in_through: options.in,
+          is_dry_run: options.dryrun,
+          is_omitting_message_from: options.messageOmitFromKey,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          max_fee: options.maxFee,
+          max_fee_rate: options.maxFeeRate,
+          message: options.message,
+          quiz_answers: flatten([options.quiz].filter(n => !!n)),
+          out_through: options.out,
+          request: commands.simpleRequest,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Offer paid services
+  .command('services', 'Run a KeySend paid services server')
+  .help('KeySend services are paid native Lightning Network services')
+  .option('--activity-fees', 'Share routing fees earned vs num fwds')
+  .option('--activity-volume', 'Share routing total volume amount')
+  .option('--connect', 'Enable requesting an inbound peer connection')
+  .option('--inbox-email-from', 'Inbox service email from address')
+  .option('--inbox-email-postmark-auth', 'Inbox service email to address')
+  .option('--inbox-email-to', 'Inbox service to email')
+  .option('--inbox-price', 'Required payment amount for inbox')
+  .option('--inbox-sms-from', 'Inbox service sms from number')
+  .option('--inbox-sms-to', 'Inbox service sms to number')
+  .option('--inbox-sms-twilio-sid', 'Inbox service Twilio account sid')
+  .option('--inbox-sms-twilio-auth', 'Inbox service Twilio auth token')
+  .option('--invoice', 'Enable creating custom invoices on demand')
+  .option('--node <node_name>', 'Saved node')
+  .option('--payer <pay_with_node_name>', 'Node to pay request responses with')
+  .option('--profile <profile>', 'Share a profile with info about your node')
+  .option('--profile-link <link>', 'Add a link to your profile', REPEATABLE)
+  .option('--network <public_key>', 'Share other service node key', REPEATABLE)
+  .option('--relay', 'Enable payments relay service', BOOL)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        services.servicePaidRequests({
+          fetch,
+          logger,
+          activity_fees: options.activityFees,
+          activity_volume: options.activityVolume,
+          inbox_email_from: options.inboxEmailFrom,
+          inbox_email_to: options.inboxEmailTo,
+          inbox_postmark_api_key: options.inboxEmailPostmarkAuth,
+          inbox_price: options.inboxPrice,
+          inbox_sms_from_number: options.inboxSmsFrom,
+          inbox_sms_to_number: options.inboxSmsTo,
+          inbox_twilio_account_sid: options.inboxSmsTwilioSid,
+          inbox_twilio_auth_token: options.inboxSmsTwilioAuth,
+          is_connect_enabled: !!options.connect || undefined,
+          is_invoice_enabled: !!options.invoice || undefined,
+          is_relay_enabled: !!options.relay || undefined,
+          network_nodes: flatten([options.network].filter(n => !!n)),
+          node: options.node,
+          payer: options.payer || options.node,
+          profile: options.profile,
+          profile_urls: flatten([options.profileLink].filter(n => !!n)),
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get a swap API key or inspect an existing one
+  .command('swap-api-key', 'Purchase a swap API key or inspect a swap API key')
+  .option('--api-key <api_key>', 'Hex encoded full swap API key')
+  .option('--purchase', 'Purchase a new swap API key')
+  .option('--macaroon <macaroon>', 'Hex encoded macaroon of swap API key')
+  .option('--node <node_name>', 'Node to use to pay for API key')
+  .option('--preimage <preimage>', 'Hex encoded preimage of swap API key')
+  .option('--service-socket <swap_service_socket>', 'host:port for service')
+  .visible(false)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return swaps.swapApiKey({
+          fetch,
+          logger,
+          api_key: options.apiKey,
+          is_purchase: options.purchase,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          macaroon: options.macaroon,
+          node: options.node,
+          preimage: options.preimage,
+          socket: options.serviceSocket,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Submarine swap with another node
+  .command('swap', 'Trade off-chain coins for on-chain via submarine swap')
+  .option('--node <node_name>', 'Node to use for swap')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return paidServices.manageSwap({
+          logger,
+          ask: await commands.interrogate({}),
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          request: commands.simpleRequest,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Create submarine swap to convert on-chain funds to off-chain
+  .command('swap-in', 'Trade on-chain coins for off-chain via submarine swap')
+  .argument('[amount]', 'Amount to receive', INT, 1e6)
+  .option('--api-key <api_key>', 'Pre-paid API key to use', hexMatch)
+  .option('--in <peer>', 'Request receiving through a specific peer')
+  .option('--max-fee <max_fee>', 'Max fee in tokens to pay', INT, 4000)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to receive funds on')
+  .option('--recovery <refund_recovery>', 'Attempt refund of swap', hexMatch)
+  .option('--refund-address <refund_address>', 'Refund address for swap')
+  .option('--service-socket <swap_service_socket>', 'host:port for service')
+  .option('--test-refund', 'Reduce refund timeout height to test refund')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return swaps.swapIn({
+          fetch,
+          logger,
+          api_key: options.apiKey || undefined,
+          fs: {getFile: readFile},
+          in_through: options.in || undefined,
+          is_refund_test: options.testRefund,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          max_fee: options.maxFee,
+          node: options.node,
+          recovery: options.recovery,
+          refund_address: options.refundAddress,
+          request: commands.simpleRequest,
+          socket: options.serviceSocket || undefined,
+          tokens: args.amount,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Adjust the set of tagged nodes
+  .command('tags', 'View or adjust the set of tagged nodes')
+  .help('Tags can be used in other commands via --tag and --avoid options')
+  .argument('[tag]', 'Adjust or view a specific tag')
+  .option('--add <public_key', 'Add a public key to a tag', REPEATABLE)
+  .option('--avoid', 'Mark to globally avoid all tagged nodes', BOOL, true)
+  .option('--icon <icon>', 'Icon to use for the tag')
+  .option('--remove <public_key>', 'Remove a public key from a tag', REPEATABLE)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return await nodes.adjustTags({
+          add: flatten([options.add].filter(n => !!n)),
+          fs: {writeFile, getFile: readFile, makeDirectory: mkdir},
+          icon: options.icon,
+          is_avoided: options.avoid,
+          remove: flatten([options.remove].filter(n => !!n)),
+          tag: !!args.tag ? args.tag.toLowerCase() : undefined,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Link up Telegram bot
+  .command('telegram', 'Post updates to a Telegram bot')
+  .help('Connect to a Telegram bot. Create bot: tg://resolve?domain=botfather')
+  .help('After creating the bot start chatting with the bot for connect code')
+  .help('Supported updates: forwards, received payments, etc')
+  .help('Multiple nodes are supported by repeating the `--node` flag')
+  .help('See README for info on persisting the bot through Docker/nohup')
+  .help('--use-proxy requires path to JSON file for host/password/port/userId')
+  .option('--budget <amount>', 'Spending amount to allow', INT, Number())
+  .option('--connect <connect_code>', 'Connection code from /connect')
+  .option('--ignore-forwards-below <amount>', 'Ignore forwards of value', INT)
+  .option('--node <node_name>', 'Node to connect to Telegram', REPEATABLE)
+  .option('--reset-api-key', 'Reset the Telegram API key')
+  .option('--use-proxy <path>', 'Proxy agent to connect to Telegram')
+  .option('--use-small-units', 'Avoid showing leading zeros on amounts')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return await telegram.connectToTelegram({
+          logger,
+          ask: await commands.interrogate({}),
+          fs: {
+            writeFile,
+            getFile: readFile,
+            getFileStatus: statSync,
+            is_reset_state: options.resetApiKey || undefined,
+            makeDirectory: mkdir,
+          },
+          id: options.connect,
+          is_small_units: options.useSmallUnits || undefined,
+          min_forward_tokens: options.ignoreForwardsBelow || undefined,
+          nodes: flatten([options.node].filter(n => !!n)),
+          payments: {limit: options.budget},
+          proxy: options.useProxy || undefined,
+          request: commands.fetchRequest({fetch}),
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Trade a secret payload
+  .command('trade-secret', 'Trade a secret with someone')
+  .help('Create or view a trade')
+  .help('Example: purchase/sell an invite link to a private group')
+  .help('Example: purchase/sell a link to a file')
+  .help('Example: buy/sell channels (experimental)')
+  .option('--node <name>', 'Saved node to use for trade')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+        const {Separator} = (await import('inquirer')).default;
+
+        return paidServices.manageTrades({
+          lnd,
+          logger,
+          ask: await commands.interrogate({}),
+          request: commands.simpleRequest,
+          separator: () => new Separator(),
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Transfer funds between own nodes
+  .command('transfer', 'Send funds off-chain to a saved node')
+  .argument('<to>', 'Saved node name')
+  .argument('[amount]', 'Amount to transfer', STRING, '1')
+  .help('Formulas are supported in amount')
+  .help('Also supported in formulas: OUT_LIQUIDITY (with outbound peer)')
+  .help('OUT_INBOUND, OUT_OUTBOUND (when specifying outbound peer)')
+  .help('IN_INBOUND, IN_OUTBOUND (when specifying inbound peer)')
+  .option('--description', 'Label describing transfer')
+  .option('--dryrun', 'Avoid actually sending funds')
+  .option('--in <pubkey_or_alias>', 'Route in through a specific peer')
+  .option('--max-fee-rate <rate>', 'Parts per million max fee rate', INT, 250)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <name>', 'Node to send funds from')
+  .option('--out <pubkey_or_alias>', 'Route out through a specific peer')
+  .option('--through <pubkey_or_alias>', 'Route in and out through a peer')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return network.transferFunds({
+          logger,
+          amount: args.amount,
+          description: options.description || undefined,
+          fs: {getFile: readFile},
+          in_through: options.in,
+          is_dry_run: options.dryrun,
+          lnd: (await lndForNode(logger, options.node)).lnd,
+          max_fee_rate: options.maxFeeRate,
+          out_through: options.out,
+          through: options.through,
+          to: (await lndForNode(logger, args.to)).lnd,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Manage triggers
+  .command('triggers', 'Manage event triggers')
+  .option('--node <name>', 'Node to manage triggers on')
+  .visible(false)
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return triggers.manageTriggers({
+          logger,
+          ask: await commands.interrogate({}),
+          lnd: (await lndForNode(logger, options.node)).lnd,
+        },
+        responses.returnObject({exit, logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Unlock wallet
+  .command('unlock', 'Unlock wallet if locked')
+  .help('Check if the wallet is locked, if so use a password file to unlock')
+  .argument('<path_to_password_file>', 'Path to password file')
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to unlock')
+  .action((args, options, logger) => {
+    return new Promise((resolve, reject) => {
+      return wallets.unlockWallet({
+        node: options.node,
+        path_to_password_file: args.pathToPasswordFile,
+      },
+      responses.returnObject({logger, reject, resolve}));
+    });
+  })
+
+  // Use a paid service
+  .command('use', 'Use a paid KeySend service from a services provider')
+  .help('KeySend services are paid native Lightning Network services')
+  .help('All communication with these services uses LN payments')
+  .help('Run services using the services command')
+  .argument('<server_id>', 'Public key of services-offering node')
+  .option('--node <node_name>', 'Saved node')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {lnd} = await lndForNode(logger, options.node);
+
+        return await services.usePaidService({
+          lnd,
+          logger,
+          ask: await commands.interrogate({}),
+          fs: {getFile: readFile},
+          network: (await lnSync.getNetwork({lnd})).network,
+          node: args.serverId,
+        });
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  })
+
+  // Get utxos
+  .command('utxos', 'Get a list of utxos')
+  .option('--confirmed', 'Return only confirmed utxos')
+  .option('--count', 'Return the count of utxos')
+  .option('--count-below <below>', 'Return only count below number', INT)
+  .option('--no-color', 'Mute all colors')
+  .option('--node <node_name>', 'Node to get utxos for')
+  .option('--size', 'UTXOs of size greater than or equal to specified amount')
+  .action((args, options, logger) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        return chain.getUtxos({
+          count_below: options.countBelow,
+          is_confirmed: !!options.confirmed,
+          is_count: !!options.count,
+          lnd: (await lnd.authenticatedLnd({logger, node: options.node})).lnd,
+          min_tokens: options.size || undefined,
+          node: options.node,
+        },
+        responses.returnObject({logger, reject, resolve}));
+      } catch (err) {
+        return logger.error({err}) && reject();
+      }
+    });
+  });
+
+prog.parse(process.argv);

@@ -1,0 +1,8 @@
+{
+  "chain-fees": "chain_fees",
+  "chain-receives": "chain_receives",
+  "chain-sends": "chain_sends",
+  "forwards": "forwards",
+  "invoices": "invoices",
+  "payments": "payments"
+}

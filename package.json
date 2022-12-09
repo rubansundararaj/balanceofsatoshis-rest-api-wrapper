@@ -1,0 +1,90 @@
+{
+  "author": {
+    "name": "Alex Bosworth",
+    "url": "https://twitter.com/alexbosworth"
+  },
+  "bin": {
+    "bos": "bos"
+  },
+  "bugs": {
+    "url": "https://github.com/alexbosworth/balanceofsatoshis/issues"
+  },
+  "dependencies": {
+    "@alexbosworth/caporal": "1.4.4",
+    "@alexbosworth/fiat": "1.0.3",
+    "@alexbosworth/html2unicode": "1.1.5",
+    "@alexbosworth/node-fetch": "2.6.2",
+    "abort-controller": "3.0.0",
+    "asciichart": "1.5.25",
+    "async": "3.2.4",
+    "asyncjs-util": "1.2.10",
+    "bech32": "2.0.0",
+    "bip66": "1.1.5",
+    "bitcoinjs-lib": "6.0.2",
+    "bolt01": "1.2.5",
+    "bolt03": "1.2.14",
+    "bolt07": "1.8.2",
+    "cbor": "8.1.0",
+    "colorette": "2.0.19",
+    "crypto-js": "4.1.1",
+    "csv-parse": "5.3.3",
+    "ecpair": "2.1.0",
+    "goldengate": "11.4.0",
+    "grammy": "1.12.0",
+    "hot-formula-parser": "4.0.0",
+    "import-lazy": "4.0.0",
+    "ini": "3.0.1",
+    "inquirer": "9.1.4",
+    "ln-accounting": "6.1.1",
+    "ln-service": "54.3.3",
+    "ln-sync": "4.0.5",
+    "ln-telegram": "4.3.1",
+    "moment": "2.29.4",
+    "paid-services": "4.1.0",
+    "probing": "3.0.0",
+    "psbt": "2.7.1",
+    "qrcode-terminal": "0.12.0",
+    "sanitize-filename": "1.6.3",
+    "socks-proxy-agent": "7.0.0",
+    "table": "6.8.1",
+    "tiny-secp256k1": "2.2.1",
+    "window-size": "1.1.1",
+    "cors": "^2.8.5",
+    "express": "^4.18.1",
+    "body-parser": "^1.20.0"
+  },
+  "description": "Lightning balance CLI",
+  "devDependencies": {
+    "@alexbosworth/tap": "15.0.11",
+    "invoices": "2.2.2",
+    "ln-docker-daemons": "3.1.6",
+    "mock-lnd": "1.4.4",
+    "tiny-secp256k1": "2.2.1"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "keywords": [
+    "cli",
+    "lightning",
+    "lightning-network",
+    "lnd",
+    "rebalance",
+    "submarine-swaps"
+  ],
+  "license": "MIT",
+  "main": "index.js",
+  "name": "balanceofsatoshis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexbosworth/balanceofsatoshis.git"
+  },
+  "scripts": {
+    "build-docker": "docker build -t alexbosworth/balanceofsatoshis . && docker save alexbosworth/balanceofsatoshis > balanceofsatoshis.tar && gzip balanceofsatoshis.tar",
+    "integration-tests": "tap --branches=1 --functions=1 --lines=1 --statements=1 -t 120 test/integration/*.js",
+    "postpack": "PACKAGE_VERSION=$(cat package.json | grep \\\"version\\\" | head -1 | awk -F: '{ print $2 }' | sed 's/[\",]//g' | tr -d '[[:space:]]') && git tag -s v$PACKAGE_VERSION -m v$PACKAGE_VERSION && git push github --tags",
+    "postpublish": "docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t alexbosworth/balanceofsatoshis --push .",
+    "test": "tap --branches=1 --functions=1 --lines=1 --statements=1 -t 60 test/arrays/*.js test/balances/*.js test/chain/*.js test/display/*.js test/encryption/*.js test/lnd/*.js test/network/*.js test/nodes/*.js test/peers/*.js test/responses/*.js test/routing/*.js test/services/*.js test/swaps/*.js test/tags/*.js test/telegram/*.js test/wallets/*.js"
+  },
+  "version": "13.10.5"
+}
